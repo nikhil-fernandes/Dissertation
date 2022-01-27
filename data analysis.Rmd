@@ -1,0 +1,3058 @@
+---
+title: "Data Analysis"
+author: "N.Fernandes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries}
+library(nhanesA)          # Package to access survey data
+#??nhanesA                # comprehensive help section available 
+
+library(RCurl)            # Used to access mortality data (open access)
+library(stringr)          # Standardise ID values
+library(dplyr)            # Joining tables
+library(tidyverse)        # Renaming columns
+library(kableExtra)       # Handles table aesthetics
+library(forcats)          # Reorder factor variables
+library(survival)         # Cox-PH Model and K-M Curves
+library(naniar)           # Replace some entries with NA
+library(tibble)           # Insert Columns in specific positions
+library(randomForestSRC)  # SRF Model
+#library(ggRandomForests)  # Produces graphics for SRF models from package above
+library(pROC)             # ROC Curve Package
+library(ROCR)             # ROC Curve Package - allows CIs
+library(polspline)        # Used in producing Calib. Plots
+library(pec)              # Calib. Plots
+library(rms)              # Calib. Plots
+```
+
+# Reading in all available mortality data
+```{r Mort. Data Read-in Function}
+# Adapting the provided code to read in NHANES data to a single function
+nhanes_read_in = function(filename) {
+
+  srvyin = paste(filename)
+  
+  # read in the fixed-width format ASCII file
+  dsn = read_fwf(file=srvyin,
+                 col_types = "ciiiiiiiddii",
+                 fwf_cols(publicid = c(1,14),
+                          eligstat = c(15,15),
+                          mortstat = c(16,16),
+                          ucod_leading = c(17,19),
+                          diabetes = c(20,20),
+                          hyperten = c(21,21),
+                          dodqtr = c(22,22),
+                          dodyear = c(23,26),
+                          wgt_new = c(27,34),
+                          sa_wgt_new = c(35,42),
+                          permth_int = c(43,45),
+                          permth_exm = c(46,48)
+                          ),
+                 na = ".")
+  
+  # create the ID (SEQN) for the NHANES surveys
+  dsn$seqn = substr(dsn$publicid,1,5)
+  # NOTE: SEQN is the unique ID for NHANES.
+  
+  #Drop NHIS variables
+  dsn <- select(dsn, -publicid)
+  dsn <- select(dsn, -dodqtr)
+  dsn <- select(dsn, -dodyear)
+  dsn <- select(dsn, -wgt_new)
+  dsn <- select(dsn, -sa_wgt_new)
+  
+  # Structure and contents of data
+  #str(dsn)
+  
+  
+  ## Variable frequencies
+  
+  #ELIGSTAT: Eligibility Status for Mortality Follow-up
+  #table(dsn$eligstat)
+  #1 = "Eligible"
+  #2 = "Under age 18, not available for public release"
+  #3 = "Ineligible"
+  
+  #MORTSTAT: Final Mortality Status
+  #table(dsn$mortstat, useNA="ifany")
+  # 0 = Assumed alive
+  # 1 = Assumed deceased
+  # <NA> = Ineligible or under age 18
+  
+  #UCOD_LEADING: Underlying Cause of Death: Recode
+  #table(dsn$ucod_leading, useNA="ifany")
+  # 1 = Diseases of heart (I00-I09, I11, I13, I20-I51)
+  # 2 = Malignant neoplasms (C00-C97)
+  # 3 = Chronic lower respiratory diseases (J40-J47)
+  # 4 = Accidents (unintentional injuries) (V01-X59, Y85-Y86)
+  # 5 = Cerebrovascular diseases (I60-I69)
+  # 6 = Alzheimer's disease (G30)
+  # 7 = Diabetes mellitus (E10-E14)
+  # 8 = Influenza and pneumonia (J09-J18)
+  # 9 = Nephritis, nephrotic syndrome and nephrosis (N00-N07, N17-N19, N25-N27)
+  # 10 = All other causes (residual)
+  # <NA> = Ineligible, under age 18, assumed alive, or no cause of death data
+  
+  #DIABETES: Diabetes Flag from Multiple Cause of Death (MCOD)
+  #table(dsn$diabetes, useNA="ifany")
+  # 0 = No - Condition not listed as a multiple cause of death
+  # 1 = Yes - Condition listed as a multiple cause of death
+  # <NA> = Assumed alive, under age 18, ineligible for mortality follow-up, or MCOD not available
+  
+  #HYPERTEN: Hypertension Flag from Multiple Cause of Death (MCOD)
+  #table(dsn$hyperten, useNA="ifany")
+  # 0 = No - Condition not listed as a multiple cause of death
+  # 1 = Yes - Condition listed as a multiple cause of death
+  # <NA> = Assumed alive, under age 18, ineligible for mortality follow-up, or MCOD not available
+  
+  test = dsn %>% filter(eligstat == 1) %>% 
+            select(seqn,permth_int,mortstat,ucod_leading,diabetes,hyperten) # selecting id column, mortality status and time
+  
+  test$seqn = str_remove(test$seqn,"^0+")
+  
+  surv_dat = plyr::rename(test, replace = c(seqn="SEQN"), warn_missing = FALSE)
+  surv_dat$SEQN = surv_dat$SEQN %>% as.factor() %>% as.character()
+  
+  return(surv_dat)
+}
+
+```
+
+
+```{r Reading in each Mort. Data Year}
+mort_files = c("NHANES_1999_2000_MORT_2015_PUBLIC.dat",
+               "NHANES_2001_2002_MORT_2015_PUBLIC.dat",
+               "NHANES_2003_2004_MORT_2015_PUBLIC.dat",
+               "NHANES_2005_2006_MORT_2015_PUBLIC.dat",
+               "NHANES_2007_2008_MORT_2015_PUBLIC.dat",
+               "NHANES_2009_2010_MORT_2015_PUBLIC.dat",
+               "NHANES_2011_2012_MORT_2015_PUBLIC.dat",
+               "NHANES_2013_2014_MORT_2015_PUBLIC.dat")
+
+mort99_00 = nhanes_read_in(mort_files[1]) #"99_00"
+mort01_02 = nhanes_read_in(mort_files[2]) #"01_02"
+mort03_04 = nhanes_read_in(mort_files[3]) #"03_04"
+mort05_06 = nhanes_read_in(mort_files[4]) #"05_06"
+mort07_08 = nhanes_read_in(mort_files[5]) #"07_08"
+mort09_10 = nhanes_read_in(mort_files[6]) #"09_10"
+mort11_12 = nhanes_read_in(mort_files[7]) #"11_12"
+mort13_14 = nhanes_read_in(mort_files[8]) #"13_14"
+```
+
+```{r Adding Year Column}
+# Adding a year column to each table
+mort99_00$year = "99/00"
+mort99_00 = mort99_00[c(7,1:6)]
+
+mort01_02$year = "01/02"
+mort01_02 = mort01_02[c(7,1:6)]
+
+mort03_04$year = "03/04"
+mort03_04 = mort03_04[c(7,1:6)]
+
+mort05_06$year = "05/06"
+mort05_06 = mort05_06[c(7,1:6)]
+
+mort07_08$year = "07/08"
+mort07_08 = mort07_08[c(7,1:6)]
+
+mort09_10$year = "09/10"
+mort09_10 = mort09_10[c(7,1:6)]
+
+mort11_12$year = "11/12"
+mort11_12 = mort11_12[c(7,1:6)]
+
+mort13_14$year = "13/14"
+mort13_14 = mort13_14[c(7,1:6)]
+```
+
+```{r Joining All Mort. Data}
+# Joining the mortality data into a single object
+
+mort_tab = merge(merge(merge(merge(merge(merge(merge(mort99_00,mort01_02,all=TRUE),
+                                               mort03_04,all=TRUE),
+                                         mort05_06,all=TRUE),
+                                   mort07_08,all=TRUE),
+                             mort09_10,all=TRUE),
+                       mort11_12,all=TRUE),
+                 mort13_14,all=TRUE)
+
+mort_tab$year = mort_tab$year %>% as.factor()
+rm(mort99_00,mort01_02,mort03_04,mort05_06,
+   mort07_08,mort09_10,mort11_12,mort13_14)
+```
+
+```{r Mortality Graphs}
+temp = mort_tab %>% filter(mortstat == 1) 
+temp$year_f = factor(temp$year,levels = c('99/00',
+                                          '01/02',
+                                          '03/04',
+                                          '05/06',
+                                          '07/08',
+                                          '09/10',
+                                          '11/12',
+                                          '13/14'))
+temp %>% 
+  ggplot(aes(x=permth_int)) + 
+  geom_histogram() + 
+  facet_wrap(~year_f) + 
+  xlab("Months until Death")
+
+temp = mort_tab %>% group_by(year) %>% count(mortstat) 
+temp$mortstat = temp$mortstat %>% as.factor()
+
+temp %>% mutate(year=fct_relevel(year,
+                                 '99/00','01/02','03/04','05/06',
+                                 '07/08','09/10','11/12','13/14')) %>% 
+  ggplot(aes(x=year,y=n,fill=mortstat)) + 
+  geom_bar(stat="identity",position=position_dodge()) +
+  scale_fill_brewer(palette="Paired") +
+  theme_minimal() +
+  ylab("Frequency") +
+  scale_fill_discrete(name="Mortality Status", labels=c("Alive","Dead"))
+rm(temp)
+```
+
+Decision: Cause of Death won't be explored (can be changed back), so those columns should be removed
+```{r Removing Columns relating to Cause of Death}
+mort_tab = mort_tab %>% select(-ucod_leading,-diabetes,-hyperten)
+```
+
+
+# Constructing table of survey (covariate) data 
+
+```{r Defining variables for every year}
+# Tables and Years
+tabs  = c('DEMO','BMX','BPX','BPQ','SMQ','ALQ','DBQ','DIQ','CDQ','HUQ','SMQFAM')
+years = c('','_B','_C','_D','_E','_F','_G','_H')
+
+# Variables (indexed by tables above)
+vars = list('DEMO' = c('DMDEDUC2','DMDEDUC3',
+                       'RIAGENDR',
+                       'DMDMARTL',
+                       'INDFMINC',
+                       'INDHHINC',
+                       'RIDAGEYR',
+                       'RIDEXPRG',
+                       'DMDBORN',
+                       'RIDRETH1',
+                       'DMDCITZN',
+                       'DMDHHSIZ'),
+            'BMX'  = c('BMXWT',
+                       'BMXHT'),
+            'BPX'  = c('BPXDI1',
+                       'BPXDI2',
+                       'BPXDI3',
+                       'BPXSY1',
+                       'BPXSY2',
+                       'BPXSY3'),
+            'BPQ'  = c('BPQ020'),
+            'SMQ'  = c('SMD080',
+                       'SMD090',
+                       'SMD030',
+                       'SMD055',
+                       'SMQ040'),
+            'ALQ'  = c('ALQ101',
+                       'ALQ110',
+                       'ALQ120Q',
+                       'ALQ120U',
+                       'ALQ130'),
+            'DBQ'  = c(),
+            'DIQ'  = c('DIQ010',
+                       'DIQ050',
+                       'DIQ080'),
+            'CDQ'  = c('CDQ010'),
+            'HUQ'  = c('HUQ010',
+                       'HUQ030',
+                       'HUQ050',
+                       'HUQ090'),
+            'SMQFAM' = c('SMD415'))
+```
+
+```{r Defining alternate variables for specific tables}
+# Specifying any alternative variables to use for specific years
+altvars = replicate(n=length(tabs), expr=list(rep(NA,length(years))))
+altvars[[1]][[5]] = c('DMDEDUC2','DMDEDUC3',
+                      'RIAGENDR',
+                      'DMDMARTL',
+                      'INDFMIN2',
+                      'INDHHIN2',
+                      'RIDAGEYR',
+                      'RIDEXPRG',
+                      'DMDBORN2',
+                      'RIDRETH1', 
+                      'DMDCITZN') %>% list()
+altvars[[1]][[6]] = altvars[[1]][[5]]
+
+altvars[[5]][[3]] = c('SMD641',
+                      'SMD650',
+                      'SMD030',
+                      'SMD055',
+                      'SMQ040') %>% list()
+
+altvars[[5]][[4]] = c('SMD641',
+                      'SMD650',
+                      'SMD030',
+                      'SMD055',
+                      'SMQ040',
+                      'SMQ620') %>% list()
+altvars[[5]][[5]] = altvars[[5]][[4]]
+altvars[[5]][[6]] = altvars[[5]][[4]]
+
+altvars[[5]][[7]] = c('SMD641',
+                      'SMD650',
+                      'SMD030',
+                      'SMD055',
+                      'SMQ040',
+                      'SMQ621') %>% list()
+altvars[[5]][[8]] = altvars[[5]][[7]]
+
+altvars[[1]][[7]] = c('DMDEDUC2','DMDEDUC3',
+                      'RIAGENDR',
+                      'DMDMARTL',
+                      'INDFMIN2',
+                      'INDHHIN2',
+                      'RIDAGEYR',
+                      'RIDEXPRG',
+                      'DMDBORN4',
+                      'RIDRETH1', 
+                      'DMDCITZN') %>% list()
+altvars[[1]][[8]] = altvars[[1]][[7]]
+
+altvars[[6]][[1]] = c('ALQ100',
+                      'ALQ110',
+                      'ALQ120Q',
+                      'ALQ120U',
+                      'ALQ130') %>% list()
+
+altvars[[6]][[2]] = c('ALD100',
+                      'ALQ110',
+                      'ALQ120Q',
+                      'ALQ120U',
+                      'ALQ130') %>% list()
+
+altvars[[11]][[8]] = c('SMD460') %>% list()
+
+altvars[[10]][[8]] = c('HUQ010',
+                       'HUQ030',
+                       'HUQ051',
+                       'HUQ090') %>% list()
+```
+
+
+```{r Extracting Survey Data for each cycle}
+for (j in seq_along(years)){
+  
+  # Extract data from the first table for the year
+  ## Check for an alternative variable list
+  if (is.na(altvars[[1]][[j]])){
+    tab = paste(tabs[1],years[j],sep='') %>% nhanes() %>% 
+          select(SEQN,vars[[1]])
+  } else {
+    tab = paste(tabs[1],years[j],sep='') %>% nhanes() %>% 
+          select(SEQN,altvars[[1]][[j]][[1]])
+  }
+  
+  for (i in seq_along(tabs)){
+    # Don't repeat the first table
+    if (i == 1){
+      next
+    }
+    
+    # Extract the next table
+    ## Check for an alternative variable list
+    if (is.na(altvars[[i]][[j]])){
+      tab_dat = paste(tabs[i],years[j],sep='') %>% nhanes() %>% 
+                select(SEQN,vars[[i]])
+    } else {
+      tab_dat = paste(tabs[i],years[j],sep='') %>% nhanes() %>% 
+                select(SEQN,altvars[[i]][[j]][[1]])
+    }
+    # Join the new table with the previous for the year
+    tab = full_join(tab,tab_dat,by='SEQN')
+    rm(tab_dat)
+  }
+  
+  # Initialise the variable to hold all the years together
+  if (j == 1){
+    surv_tab = tab
+    rm(tab)
+  } else {
+  # Otherwise, merge the new year with the previous years
+    surv_tab = merge(surv_tab,tab,all=TRUE)
+    rm(tab)
+  }
+}
+
+surv_tab$SEQN = surv_tab$SEQN %>% as.factor() %>% as.character()
+
+mod_dat = inner_join(surv_tab,mort_tab,by='SEQN')
+rm(surv_tab,mort_tab)
+```
+
+# Data Cleaning and Type Conversion
+
+```{r Initial Check of Joined Data}
+mod_dat %>% names()
+mod_dat %>% is.na() %>% colSums()
+
+km_fit = survfit(Surv(permth_int,mortstat)~1, data=mod_dat)
+plot(km_fit,xscale=12,ylab="Survival",xlab="Years since Interview",ylim = c(0.7,1))
+```
+
+Cleaning each variable
+```{r Initial Cleaning: Education}
+mod_dat %>% glimpse()
+
+
+# Checks on Education Levels
+## Entries where both are filled
+mod_dat %>% filter(!is.na(DMDEDUC2) & !is.na(DMDEDUC3)) # None
+
+## Entries where neither is filled
+mod_dat %>% filter(is.na(DMDEDUC2) & is.na(DMDEDUC3))   # 6 entries
+
+## Expected Entries for both columns
+nhanesTranslate('DEMO',c('DMDEDUC2','DMDEDUC3'))
+```
+```{r Combing to a single Education Column}
+# Isolating the Education Information
+test = mod_dat %>% select(DMDEDUC2,DMDEDUC3)
+
+# Adding column to contain final information
+test = cbind(fin=-1,test)
+
+for (i in c(1:47279)) {
+    if (!is.na(test$DMDEDUC2[i])) {
+        # Refused/Don't Know should be considered NA
+        ## Don't consider as NA
+        if (test$DMDEDUC2[[i]] == 7 | test$DMDEDUC2[[i]] == 9) {
+          ## Recode to 77 or 99 to be consistent with DMDEDUC3
+          if (test$DMDEDUC2[[i]] == 7) {
+            test$fin[[i]] = 777
+            } else {
+              test$fin[[i]] = 999
+            }
+          } else {
+          test$fin[[i]] = test$DMDEDUC2[[i]]
+        }
+    } else {
+        if (is.na(test$DMDEDUC3[i])) {next} else {
+          # Recode DMDEDUC3 to be equivalent code for DMDEDUC2
+          if (test$DMDEDUC3[[i]] == 0) {
+                test$fin[[i]] = 0
+                } else if (test$DMDEDUC3[[i]] < 9) {
+                  test$fin[[i]] = 1
+                } else if (test$DMDEDUC3[[i]] < 13) {
+                  test$fin[[i]] = 2
+                } else if (test$DMDEDUC3[[i]] < 15) {
+                  test$fin[[i]] = 3
+                } else if (test$DMDEDUC3[[i]] == 15) {
+                  test$fin[[i]] = 4
+                } else if (test$DMDEDUC3[[i]] == 66) {
+                  test$fin[[i]] = 1
+                } else if (test$DMDEDUC3[[i]] == 77) {
+                  test$fin[[i]] = 777
+                } else if (test$DMDEDUC3[[i]] == 99) {
+                  test$fin[[i]] = 999
+                }
+          }
+    }
+}
+
+# Replace the unchanged entries with NA
+test = test %>% replace_with_na(replace = list(fin=-1))
+test %>% is.na() %>% colSums()
+
+# Change to a factor
+test$fin = test$fin %>% as.factor()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, EDU_LEVEL=test$fin, .after = "SEQN")
+mod_dat = mod_dat %>% select(-DMDEDUC2,-DMDEDUC3)
+
+rm(test)
+```
+
+```{r Investigating Missing BP Measures}
+# Isolating BP Columns
+test2 = mod_dat %>% select(BPXDI1,BPXDI2,BPXDI3,
+                           BPXSY1,BPXSY2,BPXSY3)
+
+test2 %>% is.na() %>% colSums()
+test2 %>% filter(is.na(BPXDI1) &
+                 is.na(BPXDI2) &
+                 is.na(BPXDI3))   # 4,495 entries
+test2 %>% filter(is.na(BPXSY1) &
+                 is.na(BPXSY2) &
+                 is.na(BPXSY3))   # 4,495 entries
+test2 %>% filter(is.na(BPXSY1) &
+                 is.na(BPXSY2) &
+                 is.na(BPXSY3) &
+                 is.na(BPXDI1) &
+                 is.na(BPXDI2) &
+                 is.na(BPXDI3))   # 4,495 entries
+```
+
+```{r Creating Columns for Average BP Measurements}
+# Creating columns to hold average readings
+test2 = cbind(BPXDI_AVG=0,BPXSY_AVG=0,test2)
+
+# Determine the Mean Values
+di_means = test2 %>% select(BPXDI1,BPXDI2,BPXDI3) %>% rowMeans(na.rm=TRUE)
+sy_means = test2 %>% select(BPXSY1,BPXSY2,BPXSY3) %>% rowMeans(na.rm=TRUE)
+
+# Replace test2 columns
+test2$BPXDI_AVG = di_means %>% round(digits=2)
+test2$BPXSY_AVG = sy_means %>% round(digits=2)
+
+rm(di_means,sy_means)
+
+test2 %>% glimpse()
+test2 %>% is.na() %>% colSums()
+
+# Entering the new columns into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, BPXDI_AVG=test2$BPXDI_AVG,
+                              BPXSY_AVG=test2$BPXSY_AVG,.before = "BPXDI1")
+mod_dat = mod_dat %>% select(-BPXDI1,-BPXDI2,-BPXDI3,
+                             -BPXSY1,-BPXSY2,-BPXSY3)
+
+rm(test2)
+```
+
+```{r Investigating Birth Origin Columns}
+# Isolating the Birth Columns
+test3 = mod_dat %>% select(DMDBORN, DMDBORN2, DMDBORN4)
+test3 %>% is.na() %>% colSums()
+
+# Check for overlaps
+test3 %>% filter(is.na(DMDBORN) &
+                 is.na(DMDBORN2) &
+                 is.na(DMDBORN4))   # 14 entries with no info
+
+test3 %>% filter(!is.na(DMDBORN) &
+                 is.na(DMDBORN2) &
+                 is.na(DMDBORN4))  # No entries have more than one column filled
+```
+
+```{r Recoding and Merging the Birth Origin Columns}
+# Creating column to hold final codes
+test3 = cbind(test3,fin=0)
+
+for (i in c(1:47279)) {
+  # Operation for DMDBORN
+  if (!is.na(test3[i,1])) {
+    # Check if code is 'Refused' or 'Don't Know'
+    if (test3[i,1] == 7 | test3[i,1] == 9) {
+      if (test3[i,1] == 7) {
+        test3$fin[[i]] = 777
+      } else {
+        test3$fin[[i]] = 999
+      }
+    } else {
+      test3$fin[[i]] = test3[i,1]
+      next
+    }
+  } else
+  
+  # Operation for DMDBORN2
+  if (!is.na(test3[i,2])) {
+    # Check if code is 'Refused' or 'Don't Know'
+    if (test3[i,2] == 7 | test3[i,2] == 9) {
+      if (test3[i,2] == 7) {
+        test3$fin[[i]] = 777
+      } else {
+        test3$fin[[i]] = 999
+      }
+    } else {
+      test3$fin[[i]] = test3[i,2]
+      next
+    }
+  } else
+  
+  # Operation for DMDBORN4
+  if (!is.na(test3[i,3])) {
+    # Check if code is 'Refused' or 'Don't Know'
+    if (test3[i,3] == 77 | test3[i,3] == 99) {
+      if (test3[i,3] == 7) {
+        test3$fin[[i]] = 777
+      } else {
+        test3$fin[[i]] = 999
+      }
+      # Check if code is 'Others'
+    } else if (test3[i,3] == 2) {
+      test3$fin[[i]] = 3
+      next
+    } else {
+      # Otherwise the code is 1
+      test3$fin[[i]] = test3[i,3]
+    }
+  } else {next}
+}
+
+# Replace any remaining zeros with NA
+test3 = test3 %>% replace_with_na(replace = list(fin=0))
+test3 %>% is.na() %>% colSums()
+
+# Change to a factor
+test3$fin = test3$fin %>% as.factor()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, BIRTHORG=test3$fin,.before = "DMDBORN4")
+mod_dat = mod_dat %>% select(-DMDBORN,-DMDBORN2,-DMDBORN4)
+
+rm(test3)
+```
+
+```{r Investigating Family Income Cols}
+# Isolating Family Inc. Columns
+test4 = mod_dat %>% select(INDFMINC,INDFMIN2)
+test4 %>% is.na() %>% colSums()
+
+# Investigating Overlap between Columns
+test4 %>% filter(is.na(INDFMINC) &
+                 is.na(INDFMIN2))   # 567 entries with no info
+
+test4 %>% filter(!is.na(INDFMINC) &
+                 !is.na(INDFMIN2))  # No entries with both columns filled
+```
+
+```{r Recoding and Merging Family Inc. Columns}
+# Adding Columns for final codes
+test4 = cbind(test4,fin=0)
+
+for (i in c(1:47279)) {
+  # Operation on INDFMINC
+  if (!is.na(test4[i,1])) {
+    if (test4[i,1] == 77 | test4[i,1] == 99) {
+      if (test4[i,1] == 77) {
+        test4$fin[[i]] = 777
+      } else {
+        test4$fin[[i]] = 999
+      }
+    } else {
+      test4$fin[[i]] = test4[i,1]
+    }
+  } else 
+  
+  # Operation on INDFMIN2
+  if (!is.na(test4[i,2])) {
+    if (test4[i,2] == 77 | test4[i,2] == 99) {
+      if (test4[i,2] == 77) {
+        test4$fin[[i]] = 777
+      } else {
+        test4$fin[[i]] = 999
+      }
+    } else {
+      test4$fin[[i]] = test4[i,2]
+    }
+  } else {next}
+}
+
+# Replace any unchanged entries with NA
+test4 = test4 %>% replace_with_na(replace = list(fin=0))
+test4 %>% is.na() %>% colSums()
+
+# Change to a factor
+test4$fin = test4$fin %>% as.factor()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, INDFAMINC=test4$fin,.before = "INDFMINC")
+mod_dat = mod_dat %>% select(-INDFMINC,-INDFMIN2)
+
+rm(test4)
+```
+
+```{r Investigating Household Income Cols.}
+# Isolating Household Inc. Columns
+test5 = mod_dat %>% select(INDHHINC, INDHHIN2)
+test5 %>% is.na() %>% colSums()
+
+# Checking COlumn Overlaps
+test5 %>% filter(is.na(INDHHINC) &
+                 is.na(INDHHIN2))   # 2,142 entries with no info
+
+test5 %>% filter(!is.na(INDHHINC) &
+                 !is.na(INDHHIN2))  # No entry with both cols.
+```
+
+```{r Recoding and Merging Household Inc. Cols}
+# Adding Column for final codes
+test5 = cbind(test5,fin=0)
+
+for (i in c(1:47279)) {
+  # Operation on INDFMINC
+  if (!is.na(test5[i,1])) {
+    if (test5[i,1] == 77 | test5[i,1] == 99) {
+      if (test5[i,1] == 77) {
+        test5$fin[[i]] = 777
+      } else {
+        test5$fin[[i]] = 999
+      }
+    } else {
+      test5$fin[[i]] = test5[i,1]
+    }
+  } else 
+  
+  # Operation on INDFMIN2
+  if (!is.na(test5[i,2])) {
+    if (test5[i,2] == 77 | test5[i,2] == 99) {
+      if (test5[i,2] == 77) {
+        test5$fin[[i]] = 777
+      } else {
+        test5$fin[[i]] = 999
+      }
+    } else {
+      test5$fin[[i]] = test5[i,2]
+    }
+  } else {next}
+}
+
+# Replace any unchanged entries with NA
+test5 = test5 %>% replace_with_na(replace = list(fin=0))
+test5 %>% is.na() %>% colSums()
+
+# Change to a factor
+test5$fin = test5$fin %>% as.factor()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, INDHOINC=test5$fin,.before = "INDHHINC")
+mod_dat = mod_dat %>% select(-INDHHINC,-INDHHIN2)
+
+rm(test5)
+
+```
+
+```{r Investigating Smoking Cols. to Merge}
+# Isolate Smoking Cols. of Interest
+test6 = mod_dat %>% select(SMD080,SMD090,
+                           SMD641,SMD650)
+test6 %>% is.na() %>% colSums()
+
+# Checking Overlaps
+test6 %>% filter(is.na(SMD080) &
+                 is.na(SMD641))   # 37,267 empty
+test6 %>% filter(is.na(SMD090) &
+                 is.na(SMD650))   # 37,552 empty
+
+test6 %>% filter(!is.na(SMD080) &
+                 !is.na(SMD641))   # no overlap
+test6 %>% filter(!is.na(SMD090) &
+                 !is.na(SMD650))   # no overlap
+```
+
+```{r Recoding and Merging the Smoking Cols.}
+# Adding Columns for final codes
+test6 = cbind(test6,fin1=-1,fin2=-1)
+
+for (i in c(1:47279)) {
+  ## Operation on Smoking Days in Past Month
+  # Operation on SMD080
+  if (!is.na(test6[i,1])) {
+    if (test6[i,1] == 77 | test6[i,1] == 99) {
+      next
+    } else {
+      test6$fin1[[i]] = test6[i,1]
+    }
+  } else 
+  
+  # Operation on SMD642
+  if (!is.na(test6[i,3])) {
+    if (test6[i,3] == 77 | test6[i,3] == 99) {
+      next
+    } else {
+      test6$fin1[[i]] = test6[i,3]
+    }
+  } else 
+    # If both are empty
+    {next}
+  
+  ## Operation on Avg Cigarette Use over past 30 days
+  # Operation on SMD090
+  if (!is.na(test6[i,2])) {
+    if (test6[i,2] == 777 | test6[i,2] == 999) {
+      next
+    } else {
+      test6$fin2[[i]] = test6[i,2]
+    }
+  } else 
+  
+  # Operation on SMD650
+  if (!is.na(test6[i,4])) {
+    if (test6[i,4] == 777 | test6[i,4] == 999) {
+      next
+    } else {
+      test6$fin2[[i]] = test6[i,4]
+    }
+  } else 
+    # If both are empty
+    {next}
+}
+
+# Replace any unchanged entries with NA
+test6 = test6 %>% replace_with_na(replace = list(fin1=-1,fin2=-1))
+test6 %>% is.na() %>% colSums()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, SMDMNFR=test6$fin1,
+                              SMDAVGC=test6$fin2,.after = "SMQ040")
+mod_dat = mod_dat %>% select(-SMD080,-SMD090,
+                             -SMD641,-SMD650)
+
+rm(test6)
+```
+
+```{r Standardising Alcoholic Drink Sessions}
+test7 = mod_dat %>% select(ALQ120Q,ALQ120U)
+test7 %>% is.na() %>% colSums()
+
+# Checking Missing Overlap
+test7 %>% filter(is.na(ALQ120Q) & is.na(ALQ120U))    # 14,721 entries
+test7 %>% filter(!is.na(ALQ120Q) & !is.na(ALQ120U))  # 25,008 entries
+test7 %>% filter(is.na(ALQ120Q) & !is.na(ALQ120U))   # No unit given without Q
+test7 %>% filter(!is.na(ALQ120Q) & is.na(ALQ120U))   #  7,550 entries
+                                                     # Unit not provided if Q is 0 or Ref./DK
+
+# Add column for final value
+test7 = cbind(test7,fin=-1)
+
+for (i in c(1:47279)) {
+  if (is.na(test7$ALQ120U[[i]])) {
+    if (is.na(test7$ALQ120Q[[i]])) {
+      next
+    } else {
+      test7$fin[[i]] = test7$ALQ120Q[[i]]
+    }
+  } else {
+    if (test7$ALQ120U[[i]] == 1) {
+      test7$fin[[i]] = test7$ALQ120Q[[i]] * 52
+    } else if (test7$ALQ120U[[i]] == 2) {
+      test7$fin[[i]] = test7$ALQ120Q[[i]] * 12
+    } else if (test7$ALQ120U[[i]] == 3) {
+      test7$fin[[i]] = test7$ALQ120Q[[i]]
+    } 
+  }
+}
+
+# Replace any unchanged entries with NA
+test7 = test7 %>% replace_with_na(replace = list(fin=-1))
+test7 %>% is.na() %>% colSums()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, AVGDRINKSESYR=test7$fin,.before = "ALQ130")
+mod_dat = mod_dat %>% select(-ALQ120Q,
+                             -ALQ120U)
+
+rm(test7)
+```
+
+```{r Handling Intro. Questions for ALQ Tabs}
+# Isolate columns of interest
+test8 = mod_dat %>% select(ALQ100, ALD100, ALQ101)
+test8 %>% filter(is.na(ALQ100) &
+                 is.na(ALD100) &
+                 is.na(ALQ101))    # 8.912 entries
+
+# Add final column
+test8 = cbind(test8, fin=0)
+
+for (i in c(1:47279)) {
+  if (!is.na(test8$ALQ100[[i]])) {
+    test8$fin[[i]] = test8$ALQ100[[i]]
+  } else if (!is.na(test8$ALD100[[i]])) {
+    test8$fin[[i]] = test8$ALD100[[i]]
+  } else if (!is.na(test8$ALQ101[[i]])) {
+    test8$fin[[i]] = test8$ALQ101[[i]]
+  } else {next}
+}
+
+# Replace any unchanged entries with NA
+test8 = test8 %>% replace_with_na(replace = list(fin=0))
+test8 %>% is.na() %>% colSums()
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, DRINKER=test8$fin,.before = "ALQ110")
+mod_dat = mod_dat %>% select(-ALQ100,
+                             -ALD100,
+                             -ALQ101)
+
+rm(test8)
+
+# Imputing entries to ALQ110 and ALQ130 which weren't asked
+for (i in c(1:47279)) {
+  if (!is.na(mod_dat$DRINKER[i])){
+    if (mod_dat$DRINKER[i] == 1) {
+      mod_dat$ALQ110[i] = 1
+    }
+  }
+  
+  if (!is.na(mod_dat$ALQ110[i])) {
+    # Less than 12 drinks in their life (max. 12/18 per year)
+    if (mod_dat$ALQ110[i] == 2) {
+      mod_dat$ALQ130[i] = 1 # Here means <= 1
+    }
+  }
+}
+
+
+```
+
+```{r Handling Columns Indicating Smoking Status}
+# Isolate columns from table
+test9 = mod_dat %>% select(SEQN,SMQ620, SMQ621)
+
+test9 %>% filter(!is.na(SMQ620) &
+                 !is.na(SMQ621))   # Only one column is filled
+
+# Create column and fill with appropriate values 
+test9 = cbind(test9,fin=0)
+
+for (i in c(1:47279)) {
+  if (!is.na(test9$SMQ620[[i]])) {
+    test9$fin[[i]] = test9$SMQ620[[i]]
+  } else if (!is.na(test9$SMQ621[[i]])) {
+    if (test9$SMQ621[[i]] <= 2) {
+      test9$fin[[i]] = 2
+    } else if (test9$SMQ621[[i]] <= 8) {
+      test9$fin[[i]] = 1
+    } else if (test9$SMQ621[[i]] == 77) {
+      test9$fin[[i]] = 7
+    } else if (test9$SMQ621[[i]] == 99) {
+      test9$fin[[i]] = 9
+    }
+  } else {next}
+}
+
+# Extract data for SMQ620 from the previous years (1999 - 2004 i.e. until C)
+test92 = nhanes('SMQMEC') %>% select(SEQN,SMQ620)
+test93 = nhanes('SMQMEC_B') %>% select(SEQN,SMQ620) 
+test94 = nhanes('SMQMEC_C') %>% select(SEQN,SMQ620) 
+
+# Combine into a single table and filter SEQN values
+test92 =  merge(test92,test93,all=TRUE)
+test92 =  merge(test92,test94,all=TRUE)
+
+test92 = test92 %>% filter(SEQN %in% mod_dat$SEQN)
+
+# Adding the new values to the fin column
+n=c()
+for (i in c(1:15851)) {
+  if (!is.na(test92$SMQ620[[i]])) {
+    # Verify this is a new value
+    if (test9$fin[[i]] == 0) {
+      test9$fin[[i]] = test92$SMQ620[[i]]
+    } else {
+      n = c(i,n)
+    }
+  }
+}
+
+# Replace any unchanged entries with NA
+test9 = test9 %>% replace_with_na(replace = list(fin=0))
+test9 %>% is.na() %>% colSums()
+
+rm(test9,
+   test92,test93,test94)
+```
+```{r Imputing Values relating to Diabetes}
+# Isolating columns for some checks
+test10 = mod_dat %>% select(DIQ010,DIQ050,DIQ080)
+
+# See the spread of responses for missing values in DIQ080
+test10 %>% filter(is.na(DIQ080)) %>% count(DIQ050)
+test10 %>% filter(is.na(DIQ080)) %>% count(DIQ010)
+
+test10 %>% filter(is.na(DIQ050)) %>% count(DIQ010)
+
+for (i in c(1:47279)) {
+  # Check DIQ050 value
+  if (is.na(mod_dat$DIQ050[[i]])) {
+    if(!is.na(mod_dat$DIQ010[[i]])) {
+      if(mod_dat$DIQ010[[i]] == 2) {
+        mod_dat$DIQ050[[i]] = 2
+      }
+    }
+  }
+  
+  # Check DIQ080 value
+  if (is.na(mod_dat$DIQ080[[i]])) {
+    if(!is.na(mod_dat$DIQ010[[i]])) {
+      if(mod_dat$DIQ010[[i]] == 2) {
+        mod_dat$DIQ080[[i]] = 2
+      }
+    }
+  }
+}
+
+rm(test10)
+
+```
+
+```{r Handling Columns for Smoking Households}
+# Isolating the columns to use
+test11 = mod_dat %>% select(SMD415,SMD460,DMDHHSIZ)
+
+# Creating column to be merged form of smoking number in HH
+test11 = cbind(SMHH=-1,test11)
+
+rm(test11)
+
+# Removing Smoking Columns since there have significant values missing (substitution attempted but not possible)
+mod_dat = mod_dat %>% select(-DMDHHSIZ,
+                             -SMD460,
+                             -SMD415,
+                             -SMD030,
+                             -SMD055,
+                             -SMQ040,
+                             -SMDMNFR,
+                             -SMDAVGC,
+                             -SMQ621,
+                             -SMQ620)
+```
+
+```{r Combining Medical Visits}
+# Isolating relevant columns
+test12 = mod_dat %>% select(year,HUQ050,HUQ051)
+
+test12 = cbind(test12,fin=-1)
+
+for (i in c(1:47279)) {
+  if (is.na(test12$HUQ050[[i]])) {
+    if (!is.na(test12$HUQ051[[i]])) {
+      if (test12$HUQ051[[i]] == 4 | test12$HUQ051[[i]] == 5) {
+        test12$fin[[i]] = 3
+      } else if (test12$HUQ051[[i]] == 6) {
+        test12$fin[[i]] = 4
+      } else if (test12$HUQ051[[i]] == 7 | test12$HUQ051[[i]] == 8) {
+        test12$fin[[i]] = 5
+      } else {
+        test12$fin[[i]] = test12$HUQ051[[i]]
+      }
+    } else {next}
+  } else {
+    test12$fin[[i]] = test12$HUQ050[[i]]
+  }
+}
+
+# Replace any unchanged entries with NA
+test12 = test12 %>% replace_with_na(replace = list(fin=-1))
+
+test12 %>% is.na() %>% colSums()
+test12 %>% count(fin,year)
+
+# Entering the new column into mod_dat and removing the old columns
+mod_dat = add_column(mod_dat, Hosp_visits=test12$fin,.before = "BIRTHORG")
+mod_dat = mod_dat %>% select(-HUQ050,
+                             -HUQ051,
+                             -CDQ010)  # Too many missing values
+
+rm(test12)
+```
+
+```{r Cleaning the Remaining Columns}
+# Converting Refused/Unknown Responses to Missing 
+mod_dat = mod_dat %>% replace_with_na(replace = list(EDU_LEVEL=777,
+                                                     DMDMARTL=77,   
+                                                     DMDCITZN=7,    
+                                                     BPQ020=7,
+                                                     DRINKER=7,
+                                                     ALQ110=7,
+                                                     #SMQ040=7,      
+                                                     #ALQ120Q=777,   # num.
+                                                     #ALQ120U=7,     
+                                                     ALQ130=77,     # num.
+                                                     DIQ010=7,
+                                                     DIQ050=7,      
+                                                     DIQ080=7,      
+                                                     #CDQ010=7,
+                                                     HUQ010=7,
+                                                     HUQ030=7,
+                                                     HUQ090=7,
+                                                     AVGDRINKSESYR=777,
+                                                     BIRTHORG=777,
+                                                     INDFAMINC=777,
+                                                     INDHOINC=777)
+                                      )    
+mod_dat = mod_dat %>% replace_with_na(replace = list(EDU_LEVEL=999,
+                                                     DMDMARTL=99,   
+                                                     DMDCITZN=9,    
+                                                     BPQ020=9,
+                                                     DRINKER=9,
+                                                     ALQ110=9,
+                                                     #SMQ040=9,      
+                                                     #ALQ120Q=999,   # num.
+                                                     #ALQ120U=9,     
+                                                     ALQ130=99,     # num.
+                                                     DIQ010=9,
+                                                     DIQ050=9,      
+                                                     DIQ080=9,      
+                                                     #CDQ010=9,
+                                                     HUQ010=9,
+                                                     HUQ030=9,
+                                                     HUQ090=9,
+                                                     AVGDRINKSESYR=999,
+                                                     BIRTHORG=999,
+                                                     INDFAMINC=999,
+                                                     INDHOINC=999)
+                                      )    
+
+
+# Converting Covariates from Labelled Variables
+mod_dat$RIDAGEYR       = mod_dat$RIDAGEYR %>% as.numeric()
+mod_dat$BMXWT          = mod_dat$BMXWT %>% as.numeric()
+mod_dat$BMXHT          = mod_dat$BMXHT %>% as.numeric()
+mod_dat$AVGDRINKSESYR  = mod_dat$AVGDRINKSESYR %>% as.numeric()  
+mod_dat$ALQ130         = mod_dat$ALQ130 %>% as.numeric()
+
+mod_dat$EDU_LEVEL = mod_dat$EDU_LEVEL %>% as.factor()
+mod_dat$RIAGENDR  = mod_dat$RIAGENDR %>% as.factor()
+mod_dat$DMDMARTL  = mod_dat$DMDMARTL %>% as.factor()
+mod_dat$RIDEXPRG  = mod_dat$RIDEXPRG %>% as.factor()
+mod_dat$RIDRETH1  = mod_dat$RIDRETH1 %>% as.factor()
+mod_dat$DMDCITZN  = mod_dat$DMDCITZN %>% as.factor()
+mod_dat$BPQ020    = mod_dat$BPQ020 %>% as.factor()
+mod_dat$ALQ110    = mod_dat$ALQ110 %>% as.factor()
+mod_dat$DRINKER   = mod_dat$DRINKER %>% as.factor()
+mod_dat$DIQ010    = mod_dat$DIQ010 %>% as.factor()
+mod_dat$DIQ050    = mod_dat$DIQ050 %>% as.factor()
+mod_dat$DIQ080    = mod_dat$DIQ080 %>% as.factor()
+mod_dat$HUQ010    = mod_dat$HUQ010 %>% as.factor()
+mod_dat$HUQ030    = mod_dat$HUQ030 %>% as.factor()
+mod_dat$HUQ090    = mod_dat$HUQ090 %>% as.factor()
+
+# Recoding factor levels for Rej./DK Responses
+# mod_dat$DMDMARTL = recode_factor(mod_dat$DMDMARTL,77="777",99="999")
+# mod_dat$DMDCITZN = recode_factor(mod_dat$DMDCITZN,7="777",9="999")
+# mod_dat$BPQ020   = recode_factor(mod_dat$BPQ020,9="999")
+# mod_dat$SMQ040   = recode_factor(mod_dat$SMQ040,7="777",9="999")
+# mod_dat$DIQ050   = recode_factor(mod_dat$DIQ050,7="777",9="999")
+# mod_dat$DIQ080   = recode_factor(mod_dat$DIQ080,7="777",9="999")
+# mod_dat$CDQ010   = recode_factor(mod_dat$CDQ010,7="777",9="999")
+# mod_dat$HUQ010   = recode_factor(mod_dat$HUQ010,7="777",9="999")
+# mod_dat$HUQ030   = recode_factor(mod_dat$HUQ030,9="999")
+# mod_dat$HUQ090   = recode_factor(mod_dat$HUQ090,7="777",9="999")
+
+
+# Dropping any remaining unused levels from the dataframe
+mod_dat = droplevels(mod_dat)
+
+```
+
+```{r Listing the Missing Values for each Variable}
+mod_dat %>% is.na() %>% colSums()
+```
+
+```{r Removing Level from HUQ030}
+# Since the level was broke the PH assumption (seen from KM Curves) and only contributes to 208 entries, this level will be removed
+mod_dat = mod_dat %>% replace_with_na(replace = list(HUQ030=3))
+```
+
+```{r Formatting and Forming Train/Test Split}
+# Removing columns with significant missing values
+mod_dat = mod_dat %>% select(-RIDEXPRG,-AVGDRINKSESYR,-ALQ130)
+
+# Isolating rows without any missing values
+mod_dat = mod_dat[complete.cases(mod_dat),]
+
+# Establishing a (random) set of indices to split the data set
+smp_size = floor(0.75*nrow(mod_dat))
+
+set.seed(42)
+train_inds = sample(seq_len(nrow(mod_dat)), size=smp_size)
+
+mod_dat_tr = mod_dat[train_inds,]
+mod_dat_te = mod_dat[-train_inds,]
+
+mod_dat_tr = droplevels(mod_dat_tr)
+mod_dat_te = droplevels(mod_dat_te)
+```
+
+
+# Analysis and Modelling : Cox PH
+
+
+```{r KM Curves - Total Dataset}
+# Had to remove Refused and Don't Know responses from the following to ensure KM Curves are parallel
+#    EDU_LEVEL, DMDMARTL, DMDCITZN, BPQ020, DRINKER, ALQ110, DIQ010, DIQ050, DIQ080 HUQ010, HUQ030*, HUQ090
+
+# Could investigate overlap in lines for RIDRETH1 (Ethnicity),
+#                                        DMDMARTL (Marriage Status)
+#                                        BIRTHORG (Origin of Birth)
+# Find alt. method to assess fit for FAM/HH Income Bands (too many classes for visual assessment)
+
+km_fit = survfit(Surv(permth_int,mortstat)~EDU_LEVEL, data=mod_dat)
+# plot(km_fit, cumhaz=TRUE, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log)",#ylim = c(0,1),
+#      col=1:5, main='(1) Education Level', fun = "cloglog", log=TRUE)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:5, main='(1) Education Level', fun = "cloglog")#, log=TRUE)
+
+km_fit = survfit(Surv(permth_int,mortstat)~RIAGENDR, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",#ylim = c(0.5,1),
+     col=1:2, main='(2) Gender', fun = "cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DMDMARTL, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:6, main='(3) Marriage Status', fun = "cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~RIDRETH1, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:5, main='(4) Ethnicity', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DMDCITZN, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(5) Citizenship', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~BPQ020, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(6) Hypertension', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DRINKER, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(7) Alcohol Consumption in the Past Year', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~ALQ110, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(8) Lifetime Alcohol Consumption', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DIQ010, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:3, main='(9) Diabetes', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DIQ050, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(10) Insulin Usage', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DIQ080, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(11) Eyesight affected by Diabetes', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~HUQ010, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:5, main='(12) Health Condition (Subjective Opinion)', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~HUQ030, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:3, main='(13) Healthcare Service Awareness/Availability', fun="cloglog")
+legend(1,-2, legend = c("1: Yes","2: No Place","3: Multiple Places"),col=1:3, 
+       lty = 1, cex=0.8)
+
+km_fit = survfit(Surv(permth_int,mortstat)~HUQ090, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(14) Mental Health Service Usage in Past Year', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~BIRTHORG, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:7, main='(15) Origin of Birth', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~INDFAMINC, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:17, main='(16) Total Family Income', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~INDHOINC, data=mod_dat)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:17, main='(17) Total Household Income', fun="cloglog")
+
+rm(km_fit)
+```
+
+Variables that are unlikely to follow the PH assumption:
+- Total Household Income
+- Total Family Income
+- Birth Origin
+- Mental Health Service Usage
+- Healthcare Service Availablity (consider removing problematic level)
+- Eyesight affected by diabetes
+- Diabetes                       (consider removing problematic level)
+- Ethnicity
+- Marriage Status
+
+```{r KM Curves - Training Dataset}
+
+km_fit = survfit(Surv(permth_int,mortstat)~EDU_LEVEL, data=mod_dat_tr)
+# plot(km_fit, cumhaz=TRUE, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log)",#ylim = c(0,1),
+#      col=1:5, main='(1) Education Level', fun = "cloglog", log=TRUE)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:5, main='(1) Education Level', fun = "cloglog")#, log=TRUE)
+
+km_fit = survfit(Surv(permth_int,mortstat)~RIAGENDR, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",#ylim = c(0.5,1),
+     col=1:2, main='PH Test - Gender', fun = "cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DMDMARTL, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:6, main='(3) Marriage Status', fun = "cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~RIDRETH1, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:5, main='(4) Ethnicity', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DMDCITZN, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(5) Citizenship', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~BPQ020, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(6) Hypertension', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DRINKER, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(7) Alcohol Consumption in the Past Year', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~ALQ110, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(8) Lifetime Alcohol Consumption', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DIQ010, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:3, main='(9) Diabetes', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DIQ050, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(10) Insulin Usage', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~DIQ080, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(11) Eyesight affected by Diabetes', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~HUQ010, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:5, main='(12) Health Condition (Subjective Opinion)', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~HUQ030, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(13) Healthcare Service Awareness/Availability', fun="cloglog")
+legend(1,-2, legend = c("1: Yes","2: No Place"),col=1:2, 
+       lty = 1, cex=0.8)
+
+km_fit = survfit(Surv(permth_int,mortstat)~HUQ090, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:2, main='(14) Mental Health Service Usage in Past Year', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~BIRTHORG, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:7, main='(15) Origin of Birth', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~INDFAMINC, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:17, main='(16) Total Family Income', fun="cloglog")
+
+km_fit = survfit(Surv(permth_int,mortstat)~INDHOINC, data=mod_dat_tr)
+plot(km_fit, ylab="Cumulative Hazard (log)",xlab="Months since Interview (log scale)",
+     col=1:17, main='PH Test - Total Household Income', fun="cloglog")
+
+rm(km_fit)
+```
+
+Problematic Covariates:
+- Marriage Status
+- Ethnicity
+- Citizenship
+- Alcohol Consumption (mainly recently interviewed subjects)       *only new variable flagged (could be due to sample chosen)
+- Eyesight affected Diabetes
+- Healthcare Service Availability (could remove problematic level)
+- MHS Usage
+- Origin of Birth
+- Total Family Income
+- Total Household Income
+
+```{r Initial Cox Model}
+fit = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                RIAGENDR    +
+                                                DMDMARTL    +
+                                                RIDAGEYR    +
+                                                RIDRETH1    +
+                                                DMDCITZN    +
+                                                BMXHT       +
+                                                BMXWT       +
+                                                BPXSY_AVG   +
+                                                BPXDI_AVG   +
+                                                BPQ020      +
+                                                DRINKER     +
+                                                ALQ110      +
+                                                DIQ010      +
+                                                DIQ050      +
+                                                DIQ080      +
+                                                HUQ010      +
+                                                HUQ030      +
+                                                HUQ090      +
+                                                Hosp_visits +
+                                                BIRTHORG    +
+                                                INDFAMINC   +
+                                                INDHOINC,
+            data=mod_dat_tr, x=TRUE, y=TRUE)
+
+#print(fit, digits=3)
+AIC(fit)
+```
+
+```{r Cox Without Household Income}
+# Testing Household Income
+fit_2 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  DIQ080      +
+                                                  HUQ010      +
+                                                  HUQ030      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  BIRTHORG    +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit,fit_2)
+AIC(fit_2) - AIC(fit)
+```
+- The Chi-squared test fails at the 5% sig. level
+- AIC value is smaller for  the fit without total HH income
+Hence the Total Household Income variable is insignificant and can be removed
+
+```{r Cox Without Family Income}
+rm(fit)
+
+# Testing Family Income
+fit_3 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  DIQ080      +
+                                                  HUQ010      +
+                                                  HUQ030      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  BIRTHORG,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_3,fit_2)
+AIC(fit_2) - AIC(fit_3)
+```
+
+- The Chi-squared test easily passes at the 5% sig. level
+- AIC value is smaller for the fit with total FM income
+Hence the Total Family Income variable is statistically significant, and should be kept
+
+```{r Cox Without Origin of Birth}
+rm(fit_3)
+
+# Testing Birth Origin
+fit_4 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  DIQ080      +
+                                                  HUQ010      +
+                                                  HUQ030      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_4,fit_2)
+AIC(fit_2) - AIC(fit_4)
+```
+
+- The Chi-squared test easily passes at the 5% sig. level
+- AIC value is smaller for  the fit with Birth Origin
+Hence the Birth Origin variable is statistically significant, and should be kept
+
+```{r Cox Without HUQ090}
+rm(fit_4)
+
+# Testing Mental Health Service Usage
+fit_5 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  DIQ080      +
+                                                  HUQ010      +
+                                                  HUQ030      +
+                                                  Hosp_visits +
+                                                  BIRTHORG    +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_5,fit_2)
+AIC(fit_2) - AIC(fit_5)
+```
+
+- The Chi-squared test easily passes at the 5% sig. level
+- AIC value is smaller for the fit with MHS usage
+Hence the MHS Usage variable is statistically significant, and should be kept
+
+```{r Cox Without HUQ030}
+rm(fit_5)
+
+# Testing Healthcare Service Availability
+fit_6 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  DIQ080      +
+                                                  HUQ010      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  BIRTHORG    +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_6,fit_2)
+AIC(fit_2) - AIC(fit_6)
+```
+
+- The Chi-squared test fails at the 5% sig. level
+- AIC value is larger for the fit with MHS usage
+Hence the Healthcare Availability variable is statistically insignificant, and is removed
+
+
+```{r Cox Without DIQ080}
+rm(fit_2)
+
+# Testing Eyesight Affected by Diabetes
+fit_7 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  HUQ010      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  BIRTHORG    +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_7,fit_6)
+AIC(fit_6) - AIC(fit_7)
+```
+
+- The Chi-squared test passes at the 5% sig. level
+- AIC value is marginally smaller for  the fit with MHS usage
+Hence the variable is statistically significant, and can be kept
+
+```{r Cox Without Diabetes}
+rm(fit_7)
+
+# Testing Diabetes
+fit_8 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  #DIQ010      +
+                                                  DIQ050      +
+                                                  HUQ010      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  BIRTHORG    +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_8,fit_6)
+AIC(fit_8) - AIC(fit_6)
+```
+
+- The Chi-squared test easily passes at the 5% sig. level
+- AIC value is smaller for the fit with Diabetes included
+Hence the Diabetes variable is statistically significant and should be kept
+
+```{r Cox Without Ethnicity}
+rm(fit_8)
+
+# Testing RIDRETH1
+fit_9 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                  RIAGENDR    +
+                                                  DMDMARTL    +
+                                                  RIDAGEYR    +
+                                                  #RIDRETH1    +
+                                                  DMDCITZN    +
+                                                  BMXHT       +
+                                                  BMXWT       +
+                                                  BPXSY_AVG   +
+                                                  BPXDI_AVG   +
+                                                  BPQ020      +
+                                                  DRINKER     +
+                                                  ALQ110      +
+                                                  DIQ010      +
+                                                  DIQ050      +
+                                                  HUQ010      +
+                                                  HUQ090      +
+                                                  Hosp_visits +
+                                                  BIRTHORG    +
+                                                  INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_9,fit_6)
+AIC(fit_9) - AIC(fit_6)
+```
+
+- The Chi-squared test easily passes at the 5% sig. level
+- AIC value is smaller for the fit with Ethicity included
+Hence the Ethnicity variable is statistically significant and should be kept
+
+```{r Cox Without Marriage Status}
+rm(fit_9)
+
+# Testing DMDMARTL
+fit_10 = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                   RIAGENDR    +
+                                                  #DMDMARTL    +
+                                                   RIDAGEYR    +
+                                                   RIDRETH1    +
+                                                   DMDCITZN    +
+                                                   BMXHT       +
+                                                   BMXWT       +
+                                                   BPXSY_AVG   +
+                                                   BPXDI_AVG   +
+                                                   BPQ020      +
+                                                   DRINKER     +
+                                                   ALQ110      +
+                                                   DIQ010      +
+                                                   DIQ050      +
+                                                   HUQ010      +
+                                                   HUQ090      +
+                                                   Hosp_visits +
+                                                   BIRTHORG    +
+                                                   INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_10,fit_6)
+AIC(fit_10) - AIC(fit_6)
+```
+
+- The Chi-squared test easily passes at the 5% sig. level
+- AIC value is smaller for the fit with Marriage Status included
+Hence the Marriage Status variable is statistically significant and should be kept
+
+Checking the remaining variables:
+- Education Level
+- Gender
+- Age
+- Height
+- Weight
+- Blood Pressure (Systolic vs Diastolic)
+- Hypertension
+- Alcohol Consumption (Previous Year)
+- Alcohol Consumption (Lifetime)
+- Insulin Usage
+- Health Condition (Subjective)
+- Number of Hospital Visits
+
+```{r Checking Education Level}
+rm(fit_10)
+
+# Testing EDU_LEVEL
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~#EDU_LEVEL   +
+                                                      RIAGENDR    +
+                                                      DMDMARTL    +
+                                                      RIDAGEYR    +
+                                                      RIDRETH1    +
+                                                      DMDCITZN    +
+                                                      BMXHT       +
+                                                      BMXWT       +
+                                                      BPXSY_AVG   +
+                                                      BPXDI_AVG   +
+                                                      BPQ020      +
+                                                      DRINKER     +
+                                                      ALQ110      +
+                                                      DIQ010      +
+                                                      DIQ050      +
+                                                      HUQ010      +
+                                                      HUQ090      +
+                                                      Hosp_visits +
+                                                      BIRTHORG    +
+                                                      INDFAMINC,
+                  data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit_6)
+AIC(fit_comp) - AIC(fit_6)
+```
+
+Conclusion: Keep the Education Level Variable
+
+```{r Checking Gender}
+# Testing RIAGENDR
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                    #RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit_6)
+AIC(fit_comp) - AIC(fit_6)
+```
+
+Conclusion: Keep the Gender Variable
+
+```{r Checking Age}
+# Testing RIDAGEYR
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                    #RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit_6)
+AIC(fit_comp) - AIC(fit_6)
+```
+
+Conclusion: Keep the Age Variable
+
+```{r Checking Height}
+# Testing BMXHT
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit_6)
+AIC(fit_comp) - AIC(fit_6)
+```
+
+Conclusion: The Height variable is statistically insignificant
+
+```{r Checking Weight}
+# Testing BMXWT
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXHT       +
+                                                     #BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit_6)
+AIC(fit_comp) - AIC(fit_6)
+```
+
+Conclusion: The Weight variable is significant
+- since the height was insignificant, but the weight was significant, an interaction between the variables will be tested
+```{r Checking Height/Weight Interaction}
+# Testing BMXHT:BMXWT
+fit      = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXWT       +
+                                                     BMXHT:BMXWT +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: Interaction term between Height and Weight is insignificant
+
+```{r Checking Systolic BP}
+rm(fit_6)
+
+# Testing BPXSY_AVG
+fit      = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     #BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+Conclusion: Systolic BP is significant
+
+```{r Checking Diastolic BP}
+# Testing BPXDI_AVG
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     #BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: Diastolic BP is significant
+Testing an interaction between the two BP measures
+
+```{r Checking BP Measures Interaction}
+# Testing BPXSY_AVG:BPXDI_AVG
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG   +
+                                                     BPXDI_AVG   +
+                                                     BPXSY_AVG:BPXDI_AVG +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+Conclusion: The interaction term is significant and improves the AIC measure
+Hence this model will be used going forward
+
+```{r Checking Hypertension}
+# Testing BPQ020
+fit      = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     #BPQ020      +
+                                                     DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: Hypertension is significant
+
+```{r Checking Alcohol Consumption (Previous Year)}
+# Testing DRINKER
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     #DRINKER     +
+                                                     ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: Alcohol Consumption over the past year is insignificant
+
+```{r Checking Alcohol Consumption (Lifetime)}
+# Testing ALQ110
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER     +
+                                                     #ALQ110      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: Lifetime Alcohol Consumption is insignificant
+
+Testing an interaction between Alcohol Consumption over the previous year and lifetime scales
+```{r Checking Alcohol Consumption Interaction}
+# Testing Interaction
+fit_temp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     #BMXHT       +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DRINKER:ALQ110 +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+
+rm(fit_temp)
+```
+
+Conclusion: Interaction term between Alcohol related variables are insignificant
+Hence these variables will be removed
+
+```{r Checking Insulin Usage}
+# Testing DIQ050
+fit      = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DIQ010      +
+                                                     #DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: The Insulin Usage is significant
+
+```{r Checking Health Condition (Subjective)}
+# Testing HUQ010
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     #HUQ010      +
+                                                     HUQ090      +
+                                                     Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+```
+
+Conclusion: Subjective Health Condition is significant
+
+```{r Checking Number of Hospital Visits}
+# Testing Hosp_Visits
+fit_comp = coxph(formula = Surv(permth_int,mortstat)~EDU_LEVEL   +
+                                                     RIAGENDR    +
+                                                     DMDMARTL    +
+                                                     RIDAGEYR    +
+                                                     RIDRETH1    +
+                                                     DMDCITZN    +
+                                                     BMXWT       +
+                                                     BPXSY_AVG*BPXDI_AVG   +
+                                                     BPQ020      +
+                                                     DIQ010      +
+                                                     DIQ050      +
+                                                     HUQ010      +
+                                                     HUQ090      +
+                                                     #Hosp_visits +
+                                                     BIRTHORG    +
+                                                     INDFAMINC,
+                 data=mod_dat_tr,x=TRUE,y=TRUE)
+
+anova(fit_comp,fit)
+AIC(fit_comp) - AIC(fit)
+
+rm(fit_comp)
+```
+
+Conclusion: Number of Hospital Visits is significant
+
+
+# Determining Methods for Evaluative Measures
+
+```{r Concordance values}
+# concordance(fit_2,fit_3,fit_4,fit_5,fit_6,fit_7,fit_8,fit_9,fit_10)
+concordance(fit)
+```
+
+```{r Trying to produce an ROC plot with different packages}
+cox_fit = fit
+rm(fit)
+
+# ROCR Package
+rel_risk_tr = predict(cox_fit, type="risk")
+rel_risk_te = predict(cox_fit, mod_dat_te, type="risk")
+
+pred_tr = prediction(rel_risk_tr, mod_dat_tr$mortstat)
+pred_te = prediction(rel_risk_te, mod_dat_te$mortstat)
+
+perf_tr = performance(pred_tr, "tpr","fpr")
+perf_te = performance(pred_te, "tpr","fpr")
+
+plot(perf_tr,colorize=TRUE, main= "ROCR - Train Set")
+plot(perf_te,colorize=TRUE, main= "ROCR - Test Set")
+
+
+# pROC Package
+#par(pty = "s") # set plot type to square (removes empty bars on the sides)
+pROC_obj = roc(mod_dat_tr$mortstat,rel_risk_tr,
+               #smoothed = TRUE,                           # Include Smoothing??
+               
+               # arguments for ci
+               ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+               
+               # arguments for plot
+               plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+               print.auc=TRUE, show.thres=TRUE, legacy.axes=TRUE)
+
+
+sens.ci = ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue", main="Training Set")
+plot(sens.ci, type="bars", main = "Training Set")
+
+
+pROC_obj = roc(mod_dat_te$mortstat,rel_risk_te,
+               #smoothed = TRUE,
+               
+               # arguments for ci
+               ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+               
+               # arguments for plot
+               plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+               print.auc=TRUE, show.thres=TRUE, legacy.axes=TRUE)
+
+
+sens.ci = ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue", main = "Test Set")
+plot(sens.ci, type="bars", main = "Test Set")
+
+rm(perf_tr, perf_te,
+   pred_tr, pred_te,
+   pROC_obj)
+```
+
+
+# Survival RF
+
+```{r Trying an Initial SRF}
+zero = proc.time()
+
+rsf_init = rfsrc(Surv(permth_int,mortstat)~ EDU_LEVEL   +
+                                            RIAGENDR    +
+                                            DMDMARTL    +
+                                            RIDAGEYR    +
+                                            RIDRETH1    +
+                                            DMDCITZN    +
+                                            BMXHT       +
+                                            BMXWT       +
+                                            BPXSY_AVG   +
+                                            BPXDI_AVG   +
+                                            BPQ020      +
+                                            DRINKER     +
+                                            ALQ110      +
+                                            DIQ010      +
+                                            DIQ050      +
+                                            DIQ080      +
+                                            HUQ010      +
+                                            HUQ030      +
+                                            HUQ090      +
+                                            Hosp_visits +
+                                            BIRTHORG    +
+                                            INDFAMINC   +
+                                            INDHOINC,
+                 data       = mod_dat_tr,
+                 ntree      = 100,        # See plot for function of ntree for justification 
+                 nsplit     = 0,          # Traditional splits (across all data points) 
+                 forest     = T,
+                 splitrule  = "logrank",
+                 block.size = 1
+                 )
+
+time_100 = proc.time() - zero
+print(time_100)
+## NOTES
+# rsf_init$time.interest gives the ordered set of unique death times
+# When handling predictions, each column corresponds to these times
+```
+
+```{r Graph: Observed Death Times Frequencies}
+mod_dat_tr$permth_int/12 %>% count() %>% 
+  ggplot(aes(x=permth_int,y=n)) + 
+         geom_bar(stat="identity",position=position_dodge()) +
+         scale_fill_brewer(palette="Paired") +
+         theme_minimal() + 
+         geom_smooth()
+
+rsf_init %>% plot(ylim=c(0,1))
+```
+
+```{r Eval. Measure on Initial SRF}
+## Currently works with ROCR
+# Training Set
+prediction(rsf_init$predicted.oob, mod_dat_tr$mortstat) %>% 
+  performance("tpr","fpr") %>% 
+    plot(main= "ROCR - Train Set")
+
+## Attempting to produce through pROC for CIs
+srf_risk_tr = predict(rsf_init, type="risk")$predicted.oob
+srf_risk_te = predict(rsf_init, mod_dat_te, type="risk")$predicted
+
+pROC_obj = roc(mod_dat_tr$mortstat,srf_risk_tr,
+               #smoothed = TRUE,                           # Include Smoothing??
+               
+               # arguments for ci
+               ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+               
+               # arguments for plot
+               plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+               print.auc=TRUE, show.thres=TRUE, legacy.axes=TRUE)
+
+
+sens.ci = ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue", main="Training Set")
+plot(sens.ci, type="bars", main = "Training Set")
+
+
+pROC_obj = roc(mod_dat_te$mortstat,srf_risk_te,
+               #smoothed = TRUE,
+               
+               # arguments for ci
+               ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+               
+               # arguments for plot
+               plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+               print.auc=TRUE, show.thres=TRUE, legacy.axes=TRUE)
+
+
+sens.ci = ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue", main = "Test Set")
+plot(sens.ci, type="bars", main = "Test Set")
+rm(pROC_obj,sens.ci)
+```
+
+# Calibration Plots
+
+```{r Trying some Calibration Plots}
+# Setting up Cox Model
+predict.cox = 1 - predictSurvProb(cox_fit,newdata=mod_dat_tr,times=12*(1:14))
+effects_c = data.frame(cox.1yr     = double(24312),
+                       cox.1yr.cll = double(24312))
+effects_c$cox.1yr     = predict.cox[,1]
+effects_c$cox.1yr.cll = log(-log(1 - effects_c$cox.1yr))
+
+# Setting up SRF Model
+effects_f = data.frame(forest.1yr     = double(24312),
+                       forest.1yr.cll = double(24312))
+predict.forest            = 1 - predict(rsf_init,newdata=mod_dat_tr)$survival
+effects_f$forest.1yr     = predict.forest[,1*12]
+
+## Slightly increasing any value that equals zero
+for (i in c(1:8105)){
+  if (effects_f$forest.1yr[i] == 0) {
+    effects_f$forest.1yr[i] = .Machine$double.eps
+  }
+}
+
+effects_f$forest.1yr.cll = log(-log(1-effects_f$forest.1yr))
+
+# Producing Calibration Plots
+effects_c$mortstat   = mod_dat_tr$mortstat
+effects_f$mortstat   = mod_dat_tr$mortstat
+effects_c$permth_int = mod_dat_tr$permth_int
+effects_f$permth_int = mod_dat_tr$permth_int
+
+calibrate.cox        = coxph(Surv(permth_int,mortstat)~rcs(cox.1yr.cll,3),x=T, data=effects_c)
+calibrate.forest     = coxph(Surv(permth_int,mortstat)~rcs(forest.1yr.cll,3),x=T, data=effects_f)
+
+
+predict.grid.cox                  = seq(quantile(effects_c$cox.1yr,probs=0),
+                                        quantile(effects_c$cox.1yr,probs=1),
+                                        length=1000)
+
+predict.grid.cox.cll              = log(-log(1-predict.grid.cox))
+
+predict.grid.forest               = seq(quantile(effects_f$forest.1yr,probs=0),
+                                        quantile(effects_f$forest.1yr,probs=1),
+                                        length=1000)
+predict.grid.forest.cll           = log(-log(1-predict.grid.forest))
+
+predict.grid.cox.df               = data.frame(predict.grid.cox)
+predict.grid.cox.cll.df           = data.frame(predict.grid.cox.cll)
+
+predict.grid.forest.df            = data.frame(predict.grid.forest)
+predict.grid.forest.cll.df        = data.frame(predict.grid.forest.cll)
+
+names(predict.grid.cox.df)        = "cox.1yr"
+names(predict.grid.cox.cll.df)    = "cox.1yr.cll"
+
+names(predict.grid.forest.df)     = "forest.1yr"
+names(predict.grid.forest.cll.df) = "forest.1yr.cll"
+
+predict.calibrate.cox = 1 - predictSurvProb(calibrate.cox,newdata=predict.grid.cox.cll.df,times=5*12)
+
+predict.calibrate.forest = 1 - predictSurvProb(calibrate.forest,newdata=predict.grid.forest.cll.df,times=5*12)
+
+# Predicted probability of death within 1 year
+plot(predict.grid.cox,predict.calibrate.cox,type="l",lty=1,col="red",xlim=c(0,1),ylim=c(0,1),
+  xlab = "Predicted probability of 1-year mortality",
+  ylab = "Observed probability of 1-year mortality")
+
+lines(predict.grid.forest,predict.calibrate.forest,type="l",lty=2,col="blue")
+abline(0,1)
+title("1-year mortality")
+par(new=T)
+# plot(density(effects_c$cox.10yr),axes=F,xlab=NA,ylab=NA,main="")
+# axis(side=4)
+legend(0,1, legend = c("Cox PH Model","SRF"),col=c("red","blue"), 
+       lty = c(1,2), cex=0.8)
+
+rm(calibrate.cox, calibrate.forest, effects_c, effects_f,
+   predict.calibrate.cox, predict.calibrate.forest,
+   predict.cox, predict.forest,
+   predict.grid.cox.cll.df, predict.grid.cox.df,
+   predict.grid.forest.cll.df, predict.grid.forest.df,
+   predict.grid.cox, predict.grid.forest,
+   predict.grid.cox.cll, predict.grid.forest.cll)
+```
+```{r Exploring the effect of nsplit and splitrule}
+nsplit_meth = c('logrank', 'bs.gradient', 'logrankscore')
+res = c()
+
+for (j in c(1:length(nsplit_meth))) {
+  
+  if (nsplit_meth[j] == 'logrank') {
+    nsplit_vals = c(seq(50,1000,50))
+  } else {
+    nsplit_vals = c(0,seq(50,1000,50))
+  }
+  
+  comp_time   = c()
+  c_inds      = c()
+  
+  for (i in c(1:length(nsplit_vals))) {
+    zero = proc.time()
+    srf_temp = rfsrc(Surv(permth_int,mortstat)~ EDU_LEVEL   +
+                                                RIAGENDR    +
+                                                DMDMARTL    +
+                                                RIDAGEYR    +
+                                                RIDRETH1    +
+                                                DMDCITZN    +
+                                                BMXHT       +
+                                                BMXWT       +
+                                                BPXSY_AVG   +
+                                                BPXDI_AVG   +
+                                                BPQ020      +
+                                                DRINKER     +
+                                                ALQ110      +
+                                                DIQ010      +
+                                                DIQ050      +
+                                                DIQ080      +
+                                                HUQ010      +
+                                                HUQ030      +
+                                                HUQ090      +
+                                                Hosp_visits +
+                                                BIRTHORG    +
+                                                INDFAMINC   +
+                                                INDHOINC,
+                     data       = mod_dat_tr,
+                     ntree      = 100,                # See plot for function of ntree for justification 
+                     nsplit     = nsplit_vals[i],     # use index of nsplit variation
+                     forest     = F,
+                     splitrule  = nsplit_meth[j],
+                     block.size = 100
+                     )
+  
+    time = proc.time() - zero
+    
+    comp_time = c(comp_time,time[["elapsed"]])
+    c_inds    = c(c_inds, 1-srf_temp$err.rate[100])
+    print(nsplit_vals[i])
+  }
+  
+  res = c(res, data.frame(comp_time,c_inds))
+}
+
+rm(zero,srf_temp)
+
+# plot(c(0,nsplit_vals),c(time_100[["elapsed"]]/60,comp_time/60),type="o",col="red", ylab="Computational Time (Mins)")
+# plot(c(0,nsplit_vals),c(1-rsf_init$err.rate[100],c_inds), type="o", col="blue", ylim=c(0.84,0.85),
+#      ylab = "C-Index")
+
+# rm(time_100)
+```
+
+```{r Graphing the Results}
+plot(nsplit_vals,c(time_100[["elapsed"]]/60,res[[1]]/60),type="o",col="red",
+     main="Comparing Computational Time",ylab="Computational Time (Mins)",
+     xlab="Number of Splits Considered")
+lines(nsplit_vals,res[[3]]/60,type="o",col="green")
+lines(nsplit_vals,res[[5]]/60,type="o",col="blue")
+legend(750,18, legend = c("logrank","bs.gradient","logrankscore"),col=c("red","green","blue"), 
+       lty = c(1,2), cex=0.8)
+
+plot(nsplit_vals,c(1-rsf_init$err.rate[100],res[[2]]),type="o",col="red",
+     main="Discrimination Comparison",ylab="C-Index",
+     xlab="Number of Splits Considered", ylim=c(0.8,0.88))
+lines(nsplit_vals,res[[4]],type="o",col="green")
+lines(nsplit_vals,res[[6]],type="o",col="blue")
+legend(700,0.88, legend = c("logrank","bs.gradient","logrankscore"),col=c("red","green","blue"), 
+       lty = c(1,2), cex=0.8)
+```
+
+
+```{r Exploring the effect of Min. Terminal Node Size}
+# Default Minimum Node Size is 15 for survival RFs
+
+min_nd_size = c(15,seq(25,500,25))
+
+comp_time   = c()
+c_inds      = c()
+
+for (i in c(1:length(min_nd_size))) {
+  zero = proc.time()
+  srf_temp = rfsrc(Surv(permth_int,mortstat)~ EDU_LEVEL   +
+                                              RIAGENDR    +
+                                              DMDMARTL    +
+                                              RIDAGEYR    +
+                                              RIDRETH1    +
+                                              DMDCITZN    +
+                                              BMXHT       +
+                                              BMXWT       +
+                                              BPXSY_AVG   +
+                                              BPXDI_AVG   +
+                                              BPQ020      +
+                                              DRINKER     +
+                                              ALQ110      +
+                                              DIQ010      +
+                                              DIQ050      +
+                                              DIQ080      +
+                                              HUQ010      +
+                                              HUQ030      +
+                                              HUQ090      +
+                                              Hosp_visits +
+                                              BIRTHORG    +
+                                              INDFAMINC   +
+                                              INDHOINC,
+                   data       = mod_dat_tr,
+                   nodesize   = min_nd_size[i],     # Parameter under observation 
+                   ntree      = 100,                # See plot for function of ntree for justification 
+                   nsplit     = 200,                # See parameter tuning plot
+                   splitrule  = "logrank",          # See parameter tuning plot
+                   block.size = 100
+                   )
+
+  time = proc.time() - zero
+  
+  comp_time = c(comp_time,time[["elapsed"]])
+  c_inds    = c(c_inds, 1-srf_temp$err.rate[100])
+  print(min_nd_size[i])
+}
+
+res_ndsize = data.frame(comp_time,c_inds)
+
+
+rm(zero,srf_temp)
+
+
+plot(min_nd_size,res_ndsize$comp_time/60,type="o",col="red",
+     main="Comparing Computational Time",ylab="Computational Time (Mins)",
+     xlab="Minimum Terminal Node Size")
+
+plot(min_nd_size,res_ndsize$c_inds,type="o",col="red",
+     main="Discrimination Comparison",ylab="C-Index",
+     xlab="Minimum Terminal Node Size")#, ylim=c(0.8,0.88))
+```
+
+```{r Exploring the effect of Max. Tree Depth}
+# Default Max. Tree Depth parameter is ignored
+res_treedep_fin = c()
+max_tree_dep2 = seq(100,1000,50)
+
+for (j in nsplit_meth[c(1,2)]) {
+  
+  comp_time   = c()
+  c_inds      = c()
+  
+  for (i in c(1:length(c(max_tree_dep[c(1,50)],max_tree_dep2)))) {
+    zero = proc.time()
+    srf_temp = rfsrc(Surv(permth_int,mortstat)~ EDU_LEVEL   +
+                                                RIAGENDR    +
+                                                DMDMARTL    +
+                                                RIDAGEYR    +
+                                                RIDRETH1    +
+                                                DMDCITZN    +
+                                                BMXHT       +
+                                                BMXWT       +
+                                                BPXSY_AVG   +
+                                                BPXDI_AVG   +
+                                                BPQ020      +
+                                                DRINKER     +
+                                                ALQ110      +
+                                                DIQ010      +
+                                                DIQ050      +
+                                                DIQ080      +
+                                                HUQ010      +
+                                                HUQ030      +
+                                                HUQ090      +
+                                                Hosp_visits +
+                                                BIRTHORG    +
+                                                INDFAMINC   +
+                                                INDHOINC,
+                     data       = mod_dat_tr,
+                     nodesize   = 100,                 # See parameter tuning plot 
+                     ntree      = 100,                 # See plot for function of ntree for justification 
+                     nsplit     = 200,                 # See parameter tuning plot
+                     splitrule  = j,                   # Looking for alignment with previous variation
+                     nodedepth  = max_tree_dep2[i],    # Parameter under variation 
+                     block.size = 100
+                     )
+  
+    time = proc.time() - zero
+    
+    comp_time = c(comp_time,time[["elapsed"]])
+    c_inds    = c(c_inds, 1-srf_temp$err.rate[100])
+    print(c(max_tree_dep[c(1,50)],max_tree_dep2)[i])
+  }
+ 
+  res_treedep_fin = c(res_treedep_fin, data.frame(comp_time,c_inds))
+   
+}
+
+
+rm(zero,srf_temp)
+
+
+plot(max_tree_dep2,res_treedep$comp_time/60,type="o",col="red",
+     main="Comparing Computational Time",ylab="Computational Time (Mins)",
+     xlab="Maximum Tree Depth")
+
+plot(max_tree_dep2,res_treedep2$c_inds,type="o",col="red",
+     main="Discrimination Comparison",ylab="C-Index",
+     xlab="Maximum Tree Depth")#, ylim=c(0.8,0.88))
+```
+
+```{r Plots}
+plot(c(max_tree_dep[c(1,50)],max_tree_dep2),c(res_treedep$comp_time[c(1,50)],res_treedep2$comp_time)/60,type="o",col="red",
+     main="Comparing Computational Time",ylab="Computational Time (Mins)",
+     xlab="Maximum Tree Depth")
+
+plot(c(max_tree_dep[c(1,50)],max_tree_dep2),c(res_treedep$c_inds[c(1,50)],res_treedep2$c_inds),type="o",col="red",
+     main="Discrimination Comparison",ylab="C-Index",
+     xlab="Maximum Tree Depth")
+
+plot(c(max_tree_dep[c(1,50)],max_tree_dep2),res_treedep_fin[[1]]/60,type="o",col="red",
+     main="Comparing Computational Time",ylab="Computational Time (Mins)",
+     xlab="Maximum Tree Depth", ylim=c(0.35,0.6))
+lines(c(max_tree_dep[c(1,50)],max_tree_dep2),res_treedep_fin[[3]]/60,type="o",col="green")
+legend(800,0.6, legend = c("logrank","bs.gradient"),col=c("red","green"), 
+       lty = c(1,2), cex=0.8)
+
+plot(c(max_tree_dep[c(1,50)],max_tree_dep2),res_treedep_fin[[2]],type="o",col="red",
+     main="Discrimination Comparison",ylab="C-Index",
+     xlab="Maximum Tree Depth", ylim=c(0.835,0.85))
+lines(c(max_tree_dep[c(1,50)],max_tree_dep2),res_treedep_fin[[4]],type="o",col="green")
+legend(800,0.85, legend = c("logrank","bs.gradient"),col=c("red","green"), 
+       lty = c(1,2), cex=0.8)
+
+```
+
+# Final Models + Results Plots
+```{r Changing the variable names}
+current_cols = c("SEQN","EDU_LEVEL","RIAGENDR","DMDMARTL","RIDAGEYR","RIDRETH1",
+                 "DMDCITZN","BMXWT","BMXHT","BPXDI_AVG","BPXSY_AVG","BPQ020",
+                 "DRINKER","ALQ110","DIQ010","DIQ050","DIQ080","HUQ010",
+                 "HUQ030","HUQ090","Hosp_visits","BIRTHORG","INDFAMINC",
+                 "INDHOINC","year","permth_int","mortstat")
+new_cols     = c("SEQN","Education_Level","Gender","Marriage_Status","Age","Race_Eth",
+                 "Citizenship","Weight","Height","AvgBP_Diastolic","AvgBP_Systolic","Hypertension",
+                 "Drinking_Status","Alcohol_Consumption","Diabetes","Insulin_Usage","DiabetesEffect_Eyes","Health_Opinion",
+                 "Healthcare_Availability","HealthService_Usage","Hospital_Visits","Origin_of_Birth","Tot_Family_Income",
+                 "Tot_Household_Income","year","permth_int","mortstat")
+
+# Changing the variable names
+colnames(mod_dat)    = new_cols
+colnames(mod_dat_tr) = new_cols
+colnames(mod_dat_te) = new_cols
+
+```
+
+```{r Final SRF Model}
+# Cox Model
+zero = proc.time()
+cox_fit = coxph(formula = Surv(permth_int,mortstat)~Education_Level     +
+                                                    Gender              +
+                                                    Marriage_Status     +
+                                                    Age                 +
+                                                    Race_Eth            +
+                                                    Citizenship         +
+                                                    Weight              +
+                                                    AvgBP_Systolic*AvgBP_Diastolic +
+                                                    Hypertension        +
+                                                    Diabetes            +
+                                                    Insulin_Usage       +
+                                                    Health_Opinion      +
+                                                    HealthService_Usage +
+                                                    Hospital_Visits     +
+                                                    Origin_of_Birth     +
+                                                    Tot_Family_Income,
+                data=mod_dat_tr,x=TRUE,y=TRUE)
+time_cox = proc.time() - zero
+
+# SRF Model
+zero = proc.time()
+srf_fit = rfsrc(Surv(permth_int,mortstat)~ Education_Level         +
+                                           Gender                  +
+                                           Marriage_Status         +
+                                           Age                     +
+                                           Race_Eth                +
+                                           Citizenship             +
+                                           Height                  +
+                                           Weight                  +
+                                           AvgBP_Systolic          +
+                                           AvgBP_Diastolic         +
+                                           Hypertension            +
+                                           Drinking_Status         +
+                                           Alcohol_Consumption     +
+                                           Diabetes                +
+                                           Insulin_Usage           +
+                                           DiabetesEffect_Eyes     +
+                                           Health_Opinion          +
+                                           Healthcare_Availability +
+                                           HealthService_Usage     +
+                                           Hospital_Visits         +
+                                           Origin_of_Birth         +
+                                           Tot_Family_Income       +
+                                           Tot_Household_Income,
+                data       = mod_dat_tr,
+                nodesize   = 100,                 # See parameter tuning plot 
+                ntree      = 100,                 # See plot for function of ntree for justification 
+                nsplit     = 200,                 # See parameter tuning plot
+                splitrule  = "logrank",           # See parameter tuning plots
+               #nodedepth  = ignored              # See parameter tuning plots
+                block.size = 20,                  # Compute at every 20th tree
+                ntime      = 12*(1:15),           # Setting predict times for each year
+                importance = TRUE                 # Variable Importance (permutes OOB cases)
+                )
+
+time_srf = proc.time() - zero
+
+time_cox
+time_srf
+```
+
+```{r Discrimination Measure}
+# Cox Model
+cox_pred_te = predict(cox_fit, mod_dat_te, type="risk")
+pROC_obj = roc(mod_dat_te$mortstat,cox_pred_te,
+               smoothed = TRUE,
+               
+               # arguments for ci
+               ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+               
+               # arguments for plot
+               plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+               print.auc=TRUE, show.thres=TRUE, legacy.axes=TRUE)
+
+
+sens.ci = ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue", main = "Test Set",xlim=c(-0.1,1.1))
+plot(sens.ci, type="bars", main = "Test Set",xlim=c(-0.1,1.1))
+
+
+# SRF Model
+srf_pred_te = predict(srf_fit, mod_dat_te, type="risk")$predicted
+pROC_obj = roc(mod_dat_te$mortstat,srf_pred_te,
+               smoothed = TRUE,
+               
+               # arguments for ci
+               ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+               
+               # arguments for plot
+               plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+               print.auc=TRUE, show.thres=TRUE, legacy.axes=TRUE)
+
+
+sens.ci = ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue", main = "Test Set",xlim=c(-0.1,1.1))
+plot(sens.ci, type="bars", main = "Test Set",xlim=c(-0.1,1.1))
+rm(pROC_obj,sens.ci)
+```
+
+
+```{r Calib. Plot Function}
+calib_plt = function(year, limits=TRUE){
+  n = year %>% as.numeric()
+  
+  # Obtain predictions from each model
+  predict.cox    = 1 - predictSurvProb(cox_fit,newdata=mod_dat_te,times=12*(1:15))
+  predict.forest = 1 - predict(srf_fit,newdata=mod_dat_te)$survival
+
+  # Set up data frame
+  effect.df = data.frame(cox        = double(8105),
+                         cox.cll    = double(8105),
+                         srf        = double(8105),
+                         srf.cll    = double(8105),
+                         mortstat   = double(8105),
+                         permth_int = double(8105))
+  
+  # Fill the data frame
+  ## Cox
+  effect.df$cox     = predict.cox[,n]
+  effect.df$cox     = ifelse(effect.df$cox==1,0.9999,effect.df$cox)
+  effect.df$cox.cll = log(-log(1-effect.df$cox))
+  ## SRF
+  effect.df$srf     = predict.forest[,n]
+  effect.df$srf     = ifelse(effect.df$srf==0,0.0001,effect.df$srf)
+  effect.df$srf.cll = log(-log(1-effect.df$srf))
+  
+  # Adding mortality data
+  effect.df$mortstat   = mod_dat_te$mortstat
+  effect.df$permth_int = mod_dat_te$permth_int
+  
+  # Isolate data based on specified time
+  #effect_use = effect.df[effect.df$permth_int <= 12*n,]
+  
+  # Calib. Objects
+  calibrate.cox    = hare(data=effect.df$permth_int,delta=effect.df$mortstat,
+                          cov=as.matrix(effect.df$cox.cll))
+  calibrate.forest = hare(data=effect.df$permth_int,delta=effect.df$mortstat,
+                          cov=as.matrix(effect.df$srf.cll))
+  
+  # Determining values for plot
+  ## Cox Model
+  predict.grid.cox      = seq(quantile(effect.df$cox,probs=0),
+                              quantile(effect.df$cox,probs=1),length=100)
+  predict.grid.cox.cll  = log(-log(1-predict.grid.cox))
+  predict.calibrate.cox = phare(n*12,predict.grid.cox.cll,calibrate.cox)
+  
+  ## SRF Model
+  predict.grid.forest      = seq(quantile(effect.df$srf,probs=0),
+                                 quantile(effect.df$srf,probs=1),length=100)
+  predict.grid.forest.cll  = log(-log(1-predict.grid.forest))
+  predict.calibrate.forest = phare(n*12,predict.grid.forest.cll,calibrate.forest)
+  
+  # Producing Calib. Plot
+  if (limits) {
+    plot(predict.grid.cox,predict.calibrate.cox,type="l",lty=1,col="red",
+         xlim=c(0,1),ylim=c(0,1),
+         xlab = paste(c("Predicted probability of ",n,"-year mortality"),collapse = ""),
+         ylab = paste(c("Observed probability of ",n,"-year mortality"),collapse = ""))
+  } else {
+    plot(predict.grid.cox,predict.calibrate.cox,type="l",lty=1,col="red",
+         xlab = paste(c("Predicted probability of ",n,"-year mortality"),collapse = ""),
+         ylab = paste(c("Observed probability of ",n,"-year mortality"),collapse = ""))
+  }
+  
+  lines(predict.grid.forest,predict.calibrate.forest,type="l",lty=2,col="blue")
+  abline(0,1)
+  title(paste(c(n,"-year mortality"),collapse = ""))
+  legend("topleft", legend = c("Cox PH","SRF"),col=c("red","blue"), 
+       lty = c(1,2), cex=0.8)
+}
+```
+
+```{r Producing Calib. Plots}
+for (i in c(1:15)) {
+  zero = proc.time()
+  calib_plt(year=i,limits = FALSE)
+  print(proc.time() - zero)
+  print(i)
+}
+
+rm(zero)
+```
+
+```{r Deriving ICI values}
+calib_ici = function(year){
+  n = year %>% as.numeric()
+  
+  # Obtain predictions from each model
+  predict.cox    = 1 - predictSurvProb(cox_fit,newdata=mod_dat_te,times=12*(1:14))
+  predict.forest = 1 - predict(srf_fit,newdata=mod_dat_te)$survival
+
+  # Set up data frame
+  effect.df = data.frame(cox        = double(8105),
+                         cox.cll    = double(8105),
+                         srf        = double(8105),
+                         srf.cll    = double(8105),
+                         mortstat   = double(8105),
+                         permth_int = double(8105))
+  
+  # Fill the data frame
+  ## Cox
+  effect.df$cox     = predict.cox[,n]
+  effect.df$cox     = ifelse(effect.df$cox==1,0.9999,effect.df$cox)
+  effect.df$cox.cll = log(-log(1-effect.df$cox))
+  ## SRF
+  effect.df$srf     = predict.forest[,n]
+  effect.df$srf     = ifelse(effect.df$srf==0,0.0001,effect.df$srf)
+  effect.df$srf.cll = log(-log(1-effect.df$srf))
+  
+  # Adding mortality data
+  effect.df$mortstat   = mod_dat_te$mortstat
+  effect.df$permth_int = mod_dat_te$permth_int
+  
+  # Isolate data based on specified time
+  #effect_use = effect.df[effect.df$permth_int <= 12*n,]
+  
+  # Calib. Objects
+  calibrate.cox    = hare(data=effect.df$permth_int,delta=effect.df$mortstat,
+                          cov=as.matrix(effect.df$cox.cll))
+  calibrate.forest = hare(data=effect.df$permth_int,delta=effect.df$mortstat,
+                          cov=as.matrix(effect.df$srf.cll))
+  
+  # Determining ICI values 
+  ## Cox Model
+  predict.calibrate.cox    = phare(n*12,effect.df$cox.cll,calibrate.cox)
+  ICI.cox                  = mean(abs(effect.df$cox - predict.calibrate.cox))
+  E50.cox                  = median(abs(effect.df$cox - predict.calibrate.cox))
+  E90.cox                  = quantile(abs(effect.df$cox - predict.calibrate.cox),probs=0.9)
+
+  ## SRF Model
+  predict.calibrate.forest = phare(n*12,effect.df$srf.cll,calibrate.forest)
+  ICI.srf                  = mean(abs(effect.df$srf - predict.calibrate.forest))
+  E50.srf                  = median(abs(effect.df$srf - predict.calibrate.forest))
+  E90.srf                  = quantile(abs(effect.df$srf - predict.calibrate.forest),probs=0.9)
+
+  
+  c(ICI.cox,ICI.srf,
+    E50.cox,E50.srf,
+    E90.cox,E90.srf) %>% paste(collapse = ",") %>% print()
+
+}
+
+```
+
+```{r Producing ICI Values}
+calib_ici(1)
+for (i in c(1:15)) {
+  zero = proc.time()
+  calib_ici(i)
+  print(proc.time() - zero)
+  print(i)
+}
+
+rm(zero)
+```
